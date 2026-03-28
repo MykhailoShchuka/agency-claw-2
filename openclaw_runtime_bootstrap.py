@@ -17,6 +17,7 @@ from pathlib import Path
 
 try:
     import fcntl
+    
 except ImportError:  # pragma: no cover - Windows
     fcntl = None
 
