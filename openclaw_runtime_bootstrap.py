@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -11,9 +12,9 @@ import tempfile
 import hashlib
 import json
 import re
+import time
 import urllib.request
 from dataclasses import dataclass
-
 from pathlib import Path
 
 try:
@@ -35,7 +36,10 @@ def ensure_openclaw_runtime() -> None:
 
     existing_gateway_command = _read_valid_gateway_command()
     if existing_gateway_command:
+        home_dir = _resolve_bootstrap_home_dir()
         os.environ["OPENCLAW_GATEWAY_COMMAND"] = existing_gateway_command
+        _ensure_minimal_config_file(home_dir)
+        _ensure_local_operator_device_pairing(home_dir)
         return
 
     installed_gateway_command = _build_installed_gateway_command()
@@ -43,6 +47,7 @@ def ensure_openclaw_runtime() -> None:
         home_dir = _resolve_bootstrap_home_dir()
         os.environ["OPENCLAW_GATEWAY_COMMAND"] = installed_gateway_command
         _ensure_minimal_config_file(home_dir)
+        _ensure_local_operator_device_pairing(home_dir)
         logger.info("Using installed OpenClaw runtime at %s", shlex.split(installed_gateway_command)[0])
         return
 
@@ -60,6 +65,7 @@ def ensure_openclaw_runtime() -> None:
         ) from exc
     _export_runtime(bootstrapped_runtime)
     _ensure_minimal_config_file(home_dir)
+    _ensure_local_operator_device_pairing(home_dir)
     logger.info("Bootstrapped OpenClaw runtime at %s", bootstrapped_runtime.openclaw_bin)
 
 
@@ -398,6 +404,119 @@ def _ensure_minimal_config_file(home_dir: Path) -> None:
         config_path.chmod(0o600)
     except OSError:
         logger.debug("Unable to set restrictive permissions on OpenClaw config path", exc_info=True)
+
+
+def _read_json_dict(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_json_dict(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+
+
+def _merge_string_values(*values: object) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        candidates = value if isinstance(value, list) else [value]
+        for candidate in candidates:
+            if not isinstance(candidate, str):
+                continue
+            normalized = candidate.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            merged.append(normalized)
+    return merged
+
+
+def _ensure_local_operator_device_pairing(home_dir: Path) -> None:
+    identity = _read_json_dict(home_dir / ".openclaw" / "identity" / "device.json")
+    device_id = str(identity.get("deviceId") or "").strip()
+    if not device_id:
+        return
+
+    state_dir = Path(os.environ["OPENCLAW_STATE_DIR"]).expanduser().resolve() / "devices"
+    pending_path = state_dir / "pending.json"
+    paired_path = state_dir / "paired.json"
+    pending_by_id = _read_json_dict(pending_path)
+    paired_by_device_id = _read_json_dict(paired_path)
+
+    matching_pending = [
+        request
+        for request in pending_by_id.values()
+        if isinstance(request, dict) and str(request.get("deviceId") or "").strip() == device_id
+    ]
+    latest_pending = max(
+        matching_pending,
+        key=lambda request: int(request.get("ts") or 0),
+        default={},
+    )
+    existing = paired_by_device_id.get(device_id)
+    existing = existing if isinstance(existing, dict) else {}
+    now_ms = int(time.time() * 1000)
+
+    approved_scopes = _merge_string_values(
+        existing.get("approvedScopes"),
+        existing.get("scopes"),
+        latest_pending.get("scopes"),
+        "operator.admin",
+    )
+    roles = _merge_string_values(
+        existing.get("roles"),
+        existing.get("role"),
+        latest_pending.get("roles"),
+        latest_pending.get("role"),
+        "operator",
+    )
+
+    tokens = existing.get("tokens")
+    tokens = dict(tokens) if isinstance(tokens, dict) else {}
+    operator_token = tokens.get("operator")
+    operator_token = operator_token if isinstance(operator_token, dict) else {}
+    tokens["operator"] = {
+        "token": str(operator_token.get("token") or secrets.token_urlsafe(32)),
+        "role": "operator",
+        "scopes": _merge_string_values(operator_token.get("scopes"), approved_scopes),
+        "createdAtMs": int(operator_token.get("createdAtMs") or now_ms),
+        "lastUsedAtMs": operator_token.get("lastUsedAtMs"),
+    }
+
+    paired_by_device_id[device_id] = {
+        "deviceId": device_id,
+        "publicKey": str(latest_pending.get("publicKey") or identity.get("publicKeyPem") or ""),
+        "displayName": latest_pending.get("displayName") or existing.get("displayName") or "Sandbox Operator",
+        "platform": latest_pending.get("platform") or existing.get("platform") or platform.system().lower(),
+        "deviceFamily": latest_pending.get("deviceFamily") or existing.get("deviceFamily") or "server",
+        "clientId": latest_pending.get("clientId") or existing.get("clientId") or "sandbox-bootstrap",
+        "clientMode": latest_pending.get("clientMode") or existing.get("clientMode") or "cli",
+        "role": "operator",
+        "roles": roles,
+        "scopes": approved_scopes,
+        "approvedScopes": approved_scopes,
+        "remoteIp": latest_pending.get("remoteIp") or existing.get("remoteIp"),
+        "tokens": tokens,
+        "createdAtMs": int(existing.get("createdAtMs") or identity.get("createdAtMs") or now_ms),
+        "approvedAtMs": now_ms,
+    }
+
+    remaining_pending = {
+        request_id: request
+        for request_id, request in pending_by_id.items()
+        if not (
+            isinstance(request, dict)
+            and str(request.get("deviceId") or "").strip() == device_id
+        )
+    }
+    _write_json_dict(pending_path, remaining_pending)
+    _write_json_dict(paired_path, paired_by_device_id)
 
 
 def _export_runtime(runtime: _OpenClawRuntimePaths) -> None:
