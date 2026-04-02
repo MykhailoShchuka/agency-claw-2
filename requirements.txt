@@ -1,2 +1,3 @@
-agency-swarm[fastapi] @ git+https://github.com/VRSEN/agency-swarm.git@main
+agency-swarm[fastapi] @ git+https://github.com/VRSEN/agency-swarm.git@ed9131e4b25620c2aed1ba6a6c8a6d8a5f55698f
+
 python-dotenv==1.1.1
