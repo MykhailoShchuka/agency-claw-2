@@ -1,5 +1,6 @@
 # only listed properties are used by the system
 
+
 [project]
 name = "openclaw-starter-template"
 description = "One-click OpenClaw deployment template for Agencii"
