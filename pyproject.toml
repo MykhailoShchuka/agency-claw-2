@@ -1,6 +1,5 @@
 # only listed properties are used by the system
 
-
 [project]
 name = "openclaw-starter-template"
 description = "One-click OpenClaw deployment template for Agencii"
@@ -17,4 +16,3 @@ build_prepare_command = "python -u prepare_openclaw_template.py"
 memory="1564"
 cpu="1"
 use_vps = true
-
